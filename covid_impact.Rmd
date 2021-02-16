@@ -1,0 +1,418 @@
+---
+title: "Impact Covid19 - taux de mortalité"
+author: "Benjamin-Samuel Schlüter"
+date: "2/10/2021"
+editor_options:
+  chunk_output_type: console
+output: 
+  pdf_document:
+    number_sections: true
+    toc: true
+        
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+packages <- c("tidyverse", "ggplot2")
+invisible( lapply(packages, library, character.only = TRUE))
+
+# set the plotting theme
+theme_clean <- theme_bw() + 
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 12),
+        plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12, face = "italic", margin = margin(b=12)),
+        plot.caption = element_text(size = 10),
+        plot.margin = unit(c(.5,.5,.5,.5), "cm"),
+        panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(colour="grey", linetype="dashed"), 
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank())
+theme_set(theme_clean)
+
+```
+
+
+# To Do
+
+1. Analyse sur les taux avec nouvelles données, total, groupes de 5 ans, genre
+
+2. SMR pour régions
+
+3. Extraire données en Excel pour Mélanie et Audrey
+
+
+# Introduction
+
+Ceci est un petit rapport dans le contexte d'un projet de recherche commun DEMO sur l'impact de la Covid19 sur la mortalité en Belgique.
+
+# Données
+
+Les données utilisées proviennent toutes de `Open Data | STATBEL` et sont disponibles [\underline{ici}](https://statbel.fgov.be/fr/open-data?category=All). Pour la population, les fichiers utilisés sont \textit{Population par lieu de résidence, nationalité, état civil, âge et sexe} pour les dates 2015-2020. Pour les décès, le fichier est \textit{Nombre de décès par journ sexe, âge, région, province et arrondissement}. 
+
+
+```{r, echo=F, cache=T}
+
+
+# ----- Load all data sets on populations and tidy ----- #
+
+pop <- lapply(seq(2015, 2020, 1), function(year) {
+        
+        d <- openxlsx::read.xlsx(paste("./data/popBE_", year, ".xlsx", sep=""), 
+                                 detectDates = TRUE, colNames = TRUE, sheet = 1)
+
+        d <- d %>% 
+                mutate(age_gp = cut(CD_AGE,
+                                    breaks = c(0, 25, 45, 65, 75, 85, Inf),
+                                    labels = c("0-24", "25-44", "45-64", "65-74", "75-84", "85+"),
+                                    right=FALSE),
+                       sex = factor(CD_SEX, 
+                                    levels = c("M", "F"),
+                                    labels = c("Male", "Female")),
+                       TX_PROV_DESCR_FR = case_when(TX_PROV_DESCR_FR == "" | is.na(TX_PROV_DESCR_FR) ~ "Région de Bruxelles-Capitale",
+                                                    TX_PROV_DESCR_FR == "Province de Brabant flamand" ~ "Province du Brabant flamand",
+                                                    TX_PROV_DESCR_FR == "Province de Brabant wallon" ~ "Province du Brabant wallon",
+                                                    TX_PROV_DESCR_FR == "Province de Hainaut" ~ "Province du Hainaut",
+                                                    TX_PROV_DESCR_FR == "Province de Limbourg" ~ "Province du Limbourg",
+                                                    TX_PROV_DESCR_FR == "Province de Luxembourg" ~ "Province du Luxembourg",
+                                                    TRUE ~ TX_PROV_DESCR_FR),
+                       province = factor(TX_PROV_DESCR_FR),
+                       CD_PROV_REFNIS = ifelse(CD_PROV_REFNIS == "", "21000", as.character(CD_PROV_REFNIS)),
+                       region = factor(TX_RGN_DESCR_FR)) %>% 
+                group_by(province, region, sex, age_gp) %>% 
+                summarise(pop = sum(MS_POPULATION),
+                          year = year)
+        return(d)
+})
+d_pop <- do.call("rbind", pop)
+
+
+# ----- Load data set on deaths and tidy ----- #
+
+dth <- openxlsx::read.xlsx("./data/deathBE_endJan.xlsx", 
+                         detectDates = TRUE, colNames = TRUE, sheet = 1)
+d_dth <- dth %>% 
+        mutate(sex = factor(CD_SEX,
+                            levels = c(1, 2),
+                            labels = c("Male", "Female")),
+               province = factor(as.character(CD_PROV),
+                                 levels = c("10000", "30000", "40000", "60000", "90000", "20001", "20002", "50000", "70000", "80000", "04000"),
+                                 labels = levels(d_pop$province)),
+               region = factor(CD_REGIO,
+                               levels = c("02000", "03000", "04000"),
+                               labels = c("Région flamande", "Région wallonne", "Région de Bruxelles-Capitale")),
+               age_gp = CD_AGEGROUP,
+               year = substr(NR_WEEK, 1, 4) %>% as.numeric(),
+               week = substr(NR_WEEK, 7, 8) %>% as.numeric()) %>% 
+        group_by(year, week, region, province, sex, age_gp) %>% 
+        summarise(dth = sum(MS_NUM_DEATH)) %>% 
+        filter(year >= 2015,
+               year <= 2020)
+
+
+# ----- Obtain exposure (with weekly interpolation) ----- #
+
+# years used
+years <- 2015:2020
+# nber of weeks per year in dth data (need to coincide for mx computation)
+weeks <- 1:53
+regions <- levels(d_pop$region)
+provinces <- levels(d_pop$province)
+sex <- c("Female", "Male")
+ages <- levels(d_pop$age_gp)
+# data set for weekly interpolation
+d_int <- expand.grid(age_gp = ages, sex = sex, region = regions, province = provinces, week = weeks, year = years)
+# remove week 53 for some years
+# sapply(as.character(years), function(x) max(d_dth$week[d_dth$year == as.numeric(x)]), 
+# simplify = FALSE, USE.NAMES = TRUE)
+# and remove some impossible region*province 
+region_fl <- c("Province d’Anvers", "Province de Flandre occidentale", "Province de Flandre orientale", "Province du Brabant flamand", "Province du Limbourg")
+region_wa <- c("Province de Liège", "Province de Namur", "Province du Brabant wallon", "Province du Hainaut", "Province du Luxembourg")
+d_int <- d_int %>% 
+        filter(!(year %in% 2016:2019 & week == 53), 
+               !(region == "Région de Bruxelles-Capitale" & province != "Région de Bruxelles-Capitale"),
+               !(region == "Région flamande" & province %in% c(region_wa, "Région de Bruxelles-Capitale")),
+               !(region == "Région wallonne" & province %in% c(region_fl, "Région de Bruxelles-Capitale")))
+  
+# function computing weekly interpolation/extrapolation 
+interpol <- function(region, province, sex, age_gp, year, week) {
+        
+        r <- as.character(region)
+        p <- as.character(province)
+        s <- as.character(sex)
+        a <- as.character(age_gp)
+        t.lo <- ifelse(year < 2020, year, 2018) # 2018 as start of ref period for 2020 extrapolation
+        t.up <- ifelse(year < 2020, year+1, year) 
+        dt <- ifelse(year %in% 2016:2019, (week-1)/52, (week-1)/53) # identifies position within a year
+        prop <- ifelse(year %in% 2016:2019, 1/52, 1/53) # prop of person-year in a week
+        n <- ifelse(year < 2020, 1, 2)
+        pop_t.lo <- d_pop$pop[d_pop$region == r & d_pop$province== p & d_pop$sex == s & d_pop$age_gp == a & d_pop$year == t.lo]
+        pop_t.up <- d_pop$pop[d_pop$region == r & d_pop$province == p & d_pop$sex == s & d_pop$age_gp == a & d_pop$year == t.up]
+        
+        # intrapolation/extrapolation (exponentielle)
+        r <- log(pop_t.up/pop_t.lo)/n
+        exp <- ifelse(year < 2020, (pop_t.lo*exp(r*dt))*prop, (pop_t.up*exp(r*dt))*prop)
+}
+# if year<2020, intrapolate otherwise, extrapolate
+d_int <- d_int %>% 
+        mutate(exp = pmap_dbl(list(region, province, sex, age_gp, year, week), interpol)) 
+# plot exposure
+fig_interpol <- d_int %>% 
+        group_by(region, age_gp, year, sex, week) %>% 
+        filter(region == "Région de Bruxelles-Capitale",
+               age_gp == "75-84") %>% 
+        ggplot(aes(x=week, y=exp, color=year)) +
+        geom_point() + 
+        theme_bw() +
+        facet_wrap(~sex, scales = "free_y") +
+        labs(title = "Interpolation par semaine",
+       subtitle = "Groupe d'âge 75-84",
+       x = "Semaine",
+       y = "N")
+  
+
+
+# merge both data sets   
+d <- left_join(d_int, d_dth, 
+               by = c("year", "week", "sex", "age_gp", "region", "province")) %>% 
+          mutate(dth = ifelse(is.na(dth), 0, dth))
+
+```
+
+
+
+
+# Méthode
+
+* Les groupes d'âges utilisés sont ceux tels que définit dans le fichier reprenant les décès: 0-24, 25-44, 45-64, 65-74, 75-84 et 85+.
+
+* La population de 2021 est une extrapolation supposant une croissance exponentielle utilisant comme période de référence 2018-2020 en stratifiant par sexe, groupe d'âge et région.
+
+* La fréquence est la semaine pour éviter le lissage et réduire le bruit. Interpolation hebdomadaire de la population au sein d'une année \textit{t} en supposant une croissance exponentielle entre l'année \textit{t} et \textit{t+1}.
+
+* La surmortalité présentée ci-dessous représente la ratio $\frac{m_{g}^{i, 2020}}{\bar{m}_{g}^{i,2015-19}}$ où i est une semaine donnée, $\bar{m}_{g}^{i,2015-19}$ est la moyenne des $m_{g}^i$ sur la période de référence 2015-2019 pour la semaine \textit{i} et \textit{g} correspond aux différentes catégories au sein des variables étudiées (région, groupe d'âge et sexe).
+
+
+
+
+
+
+# Résultats
+
+```{r, eval=F}
+
+# Belgium as a whole
+d %>% 
+        group_by(week, year) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         periode = ifelse(year < 2020, "2015-2019", "2020")) %>% 
+  ggplot(aes(x=week, y=mx, color=periode, group=year)) +
+        geom_line() +
+        theme_bw() +
+        scale_color_manual(values = c("2015-2019" = "grey", "2020" = "black")) +
+  xlab("Semaine") +
+  ylab("Taux de mortalité")
+
+# Belgium by gender
+d %>% 
+        group_by(week, year, sex) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         periode = ifelse(year < 2020, "2015-2019", "2020")) %>% 
+  ggplot(aes(x=week, y=mx, color=periode, group=year)) +
+        geom_line() +
+        theme_bw() +
+        scale_color_manual(values = c("2015-2019" = "grey", "2020" = "black")) +
+  xlab("Semaine") +
+  ylab("Taux de mortalité") +
+  facet_wrap(~sex)
+
+# Belgium by region
+d %>% 
+        group_by(week, year, region) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         periode = ifelse(year < 2020, "2015-2019", "2020")) %>% 
+  ggplot(aes(x=week, y=mx, color=periode, group=year)) +
+        geom_line() +
+        theme_bw() +
+        scale_color_manual(values = c("2015-2019" = "grey", "2020" = "black")) +
+  xlab("Semaine") +
+  ylab("Taux de mortalité") +
+  facet_wrap(~region)
+
+# Belgium by age gp
+d %>% 
+        group_by(week, year, age_gp) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         periode = ifelse(year < 2020, "2015-2019", "2020")) %>% 
+  filter(age_gp %in% c("45-64", "65-74", "75-84", "85+")) %>% 
+  ggplot(aes(x=week, y=mx, color=periode, group=year)) +
+        geom_line() +
+        theme_bw() +
+        scale_color_manual(values = c("2015-2019" = "grey", "2020" = "black")) +
+  xlab("Semaine") +
+  ylab("Taux de mortalité") +
+  facet_wrap(~age_gp)
+
+```
+
+
+```{r}
+
+
+# ----- Excess mortality ----- #
+
+# belgium
+d %>% 
+        group_by(week, year) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         type = ifelse(year < 2020, "mx_ref", "mx_target")) %>% 
+  group_by(week, type) %>% 
+  summarise(mx = mean(mx)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = type, values_from = mx) %>% 
+  mutate(ratio = mx_target/mx_ref) %>% 
+  ggplot(aes(x=week, y=ratio)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  labs(title = "Surmortalité relative en 2020",
+       subtitle = "Ratio des taux de mortalité par semaine, période de référence 2015-2019",
+       x = "Semaine",
+       y = "")
+
+```
+
+
+```{r}
+
+
+# ----- Excess mortality ----- #
+
+# region
+d %>% 
+        group_by(week, year, region) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         type = ifelse(year < 2020, "mx_ref", "mx_target")) %>% 
+  group_by(week, type, region) %>% 
+  summarise(mx = mean(mx)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = type, values_from = mx) %>% 
+  mutate(ratio = mx_target/mx_ref) %>% 
+  ggplot(aes(x=week, y=ratio, color = region)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  labs(title = "Surmortalité relative en 2020 par région",
+       subtitle = "Ratio des taux de mortalité par semaine, période de référence 2015-2019",
+       x = "Semaine",
+       y = "")
+```
+
+
+```{r}
+
+
+# ----- Excess mortality ----- #
+
+# age gp
+d %>% 
+  filter(age_gp %in% c("45-64", "65-74", "75-84", "85+")) %>%      
+  group_by(week, year, age_gp) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         type = ifelse(year < 2020, "mx_ref", "mx_target")) %>% 
+  group_by(week, type, age_gp) %>% 
+  summarise(mx = mean(mx)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = type, values_from = mx) %>% 
+  mutate(ratio = mx_target/mx_ref) %>% 
+  ggplot(aes(x=week, y=ratio, color = age_gp)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  labs(title = "Surmortalité relative en 2020 par groupe d'âge",
+       subtitle = "Ratio des taux de mortalité par semaine, période de référence 2015-2019",
+       x = "Semaine",
+       y = "")
+```
+
+
+
+```{r}
+
+
+# ----- Excess mortality ----- #
+
+# gender
+d %>% 
+  group_by(week, year, sex) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         type = ifelse(year < 2020, "mx_ref", "mx_target")) %>% 
+  group_by(week, type, sex) %>% 
+  summarise(mx = mean(mx)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = type, values_from = mx) %>% 
+  mutate(ratio = mx_target/mx_ref) %>% 
+  ggplot(aes(x=week, y=ratio, color = sex)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  labs(title = "Surmortalité relative en 2020 par sexe",
+       subtitle = "Ratio des taux de mortalité par semaine, période de référence 2015-2019",
+       x = "Semaine",
+       y = "")
+```
+
+
+
+```{r}
+
+
+# ----- Excess mortality ----- #
+
+# province
+d %>% 
+  group_by(week, year, province) %>% 
+        summarise(dth = sum(dth),
+                  exp = sum(exp)) %>% 
+  ungroup() %>% 
+  mutate(mx = dth/exp,
+         type = ifelse(year < 2020, "mx_ref", "mx_target")) %>% 
+  group_by(week, type, province) %>% 
+  summarise(mx = mean(mx)) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = type, values_from = mx) %>% 
+  mutate(ratio = mx_target/mx_ref) %>% 
+  ggplot(aes(x=week, y=ratio, color = province)) +
+  geom_line() +
+  geom_hline(yintercept = 1) +
+  labs(title = "Surmortalité relative en 2020 par province",
+       subtitle = "Ratio des taux de mortalité par semaine, période de référence 2015-2019",
+       x = "Semaine",
+       y = "") +
+  theme(legend.text = element_text(size = 5))
+```
+
